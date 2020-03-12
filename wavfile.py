@@ -40,12 +40,6 @@ import warnings
 import numpy
 
 
-class WavFileWarning(UserWarning):
-    pass
-
-
-_ieee = False
-
 SEEK_ABSOLUTE = 0
 SEEK_RELATIVE = 1
 
@@ -57,11 +51,9 @@ def _read_fmt_chunk(fid):
     size, comp, noc, rate, sbytes, ba, bits = res
     if comp != 1 or size > 16:
         if comp == 3:
-            global _ieee
-            _ieee = True
-            warnings.warn("IEEE format not supported", WavFileWarning)
+            warnings.warn("IEEE format not supported")
         else:
-            warnings.warn("Unfamiliar format bytes", WavFileWarning)
+            warnings.warn("Unfamiliar format bytes")
         if size > 16:
             fid.read(size - 16)
     return size, comp, noc, rate, sbytes, ba, bits
@@ -128,31 +120,18 @@ def read_wav_info(file):
         bytes = bits // 8
         dtype = '<i%d' % bytes
 
-    if bits == 32 and _ieee:
+    if bits == 32 and comp == 3:
         dtype = 'float32'
 
     fid.close()
     return size, comp, noc, rate, sbytes, ba, bits, bytes, dtype
 
 
-def read_data(fid, data_cursor, fmt_info, data_size, beg_ms=0, end_ms=None, mono=False, normalised=True, retype=True):
+def convert_ms_to_frames(fmt_info, data_size, beg_ms=0, end_ms=None):
     bits = fmt_info['bits']
     ba = fmt_info['ba']
     rate = fmt_info['rate']
     noc = fmt_info['noc']
-
-    if data_cursor:
-        fid.seek(data_cursor, SEEK_ABSOLUTE)
-    if bits == 8 or bits == 24:
-        dtype = 'u1'
-        bytes = 1
-    else:
-        bytes = bits // 8
-        dtype = '<i%d' % bytes
-
-    if bits == 32 and _ieee:
-        dtype = 'float32'
-
     beg = int(beg_ms * rate * ba / 1000)
 
     # Important #2: beg must be at the beginning of a frame
@@ -163,7 +142,6 @@ def read_data(fid, data_cursor, fmt_info, data_size, beg_ms=0, end_ms=None, mono
     # (bytes per frame * number of channels)
     byte_per_frame = bits // 8
     beg = nearest_multiple(beg, byte_per_frame * noc)
-    fid.seek(beg, SEEK_RELATIVE)
 
     if end_ms is None:
         requested_end = data_size
@@ -172,16 +150,31 @@ def read_data(fid, data_cursor, fmt_info, data_size, beg_ms=0, end_ms=None, mono
     end = nearest_multiple(requested_end, byte_per_frame * noc, data_size)
     zero_pad = requested_end - end
 
-    chunk_size = end - beg
-    if retype:
+    fmt_info['beg'] = beg
+    fmt_info['end'] = end
+    fmt_info['zero_pad'] = zero_pad
+    return fmt_info
+
+
+class IntReader:
+    @staticmethod
+    def read_no_process(fid, fmt_info):
+        beg = fmt_info['beg']
+        end = fmt_info['end']
+        dtype = fmt_info['dtype']
+        bytes = fmt_info['bytes']
+
+        fid.seek(beg, SEEK_RELATIVE)
+        chunk_size = end - beg
         data = numpy.fromfile(fid, dtype=dtype, count=chunk_size // bytes)
         fid.close()
+        return data
 
-        if bits == 24:
-            a = numpy.empty((len(data) // 3, 4), dtype='u1')
-            a[:, :3] = data.reshape((-1, 3))
-            a[:, 3:] = (a[:, 3 - 1:3] >> 7) * 255
-            data = a.view('<i4').reshape(a.shape[:-1])
+    @staticmethod
+    def post_process(fmt_info, data, mono, normalised):
+        noc = fmt_info['noc']
+        zero_pad = fmt_info['zero_pad']
+        bits = fmt_info['bits']
 
         if noc > 1:
             data = data.reshape(-1, noc)
@@ -201,9 +194,118 @@ def read_data(fid, data_cursor, fmt_info, data_size, beg_ms=0, end_ms=None, mono
             data = numpy.ascontiguousarray(data, dtype=numpy.float32) * normfactor
         else:
             data = numpy.ascontiguousarray(data, dtype=data.dtype)
+        return data
+
+
+class Int24Reader(IntReader):
+    @staticmethod
+    def read_no_process(fid, fmt_info):
+        data = IntReader.read_no_process(fid, fmt_info)
+
+        a = numpy.empty((len(data) // 3, 4), dtype='u1')
+        a[:, :3] = data.reshape((-1, 3))
+        a[:, 3:] = (a[:, 3 - 1:3] >> 7) * 255
+        data = a.view('<i4').reshape(a.shape[:-1])
+        return data
+
+
+
+class UbyteReader(IntReader):
+    @staticmethod
+    def post_process(fmt_info, data, mono, normalised):
+        """
+        There shall be no normalisation, monoisation nor padding if the data is Ubyte.
+        Ubyte is used only to preserve the data in the copying process
+        :param fmt_info:
+        :param data:
+        :param mono:
+        :param normalised:
+        :return:
+        """
+        return data
+
+
+class FloatReader(IntReader):
+    @staticmethod
+    def post_process(fmt_info, data, mono, normalised):
+        """
+        Float-typed WAV is already normalised. So the post process is reversed:
+          - If normalised is True, then don't do anything
+          - If normalised is False, then denormalise it
+        :param fmt_info:
+        :param data:
+        :param mono:
+        :param normalised:
+        :return:
+        """
+        noc = fmt_info['noc']
+        zero_pad = fmt_info['zero_pad']
+        bits = fmt_info['bits']
+
+        if noc > 1:
+            data = data.reshape(-1, noc)
+
+            if mono:
+                data = data[:, 0]
+
+        if zero_pad:
+            if len(data.shape) == 1:
+                zeros = numpy.zeros((zero_pad,), dtype=data.dtype)
+            else:
+                zeros = numpy.zeros((zero_pad, data.shape[1]), dtype=data.dtype)
+            data = numpy.concatenate((data, zeros), axis=0)
+
+        if normalised:
+            data = numpy.ascontiguousarray(data, dtype=data.dtype)
+        else:
+            data[data > 1.0] = 1.0
+            data[data < -1.0] = -1.0
+            data = numpy.asarray(data * (2 ** 31 - 1), dtype=numpy.int32)
+        return data
+
+
+def read_data(fid, data_cursor, fmt_info, data_size, beg_ms=0, end_ms=None, mono=False, normalised=True):
+    if data_cursor:
+        fid.seek(data_cursor, SEEK_ABSOLUTE)
+
+    reader_class = get_reader_class(fmt_info)
+    convert_ms_to_frames(fmt_info, data_size, beg_ms, end_ms)
+    data = reader_class.read_no_process(fid, fmt_info)
+    return reader_class.post_process(fmt_info, data, mono, normalised)
+
+
+def get_reader_class(fmt_info):
+    bits = fmt_info['bits']
+    comp = fmt_info['comp']
+    retype = fmt_info['retype']
+
+    if comp == 3:
+        bytes = bits // 8
+        dtype = '<f%d' % bytes
+        reader_class = FloatReader
     else:
-        data = numpy.fromfile(fid, dtype=numpy.ubyte, count=chunk_size)
-    return data
+        if retype:
+            if bits == 8:
+                dtype = 'u1'
+                bytes = 1
+                reader_class = IntReader
+            elif bits == 24:
+                dtype = 'u1'
+                bytes = 1
+                reader_class = Int24Reader
+            else:
+                bytes = bits // 8
+                dtype = '<i%d' % bytes
+                reader_class = IntReader
+        else:
+            dtype = numpy.ubyte
+            bytes = 1
+            reader_class = UbyteReader
+
+    fmt_info['dtype'] = dtype
+    fmt_info['bytes'] = bytes
+
+    return reader_class
 
 
 def read_segment(file, beg_ms=0, end_ms=None, mono=False, normalised=True, return_fs=False, retype=True):
@@ -225,8 +327,12 @@ def read_segment(file, beg_ms=0, end_ms=None, mono=False, normalised=True, retur
     fsize = _read_riff_chunk(fid)
     rate = None
 
-    fmt_info = dict()
+    fmt_info = dict(retype=retype)
+
+    # This variable stores the start address of the data block, it is useful in case the 'fmt ' block comes AFTER
+    # the 'data' block, meaning that we need to read the fmt block to collect info and THEN come back to the data block
     data_cursor = None
+
     data_size = None
     retval = None
 
@@ -238,10 +344,12 @@ def read_segment(file, beg_ms=0, end_ms=None, mono=False, normalised=True, retur
             fmt_info['ba'] = ba
             fmt_info['bits'] = bits
             fmt_info['noc'] = noc
+            fmt_info['comp'] = comp
         elif chunk_id == b'data':
             data_size = struct.unpack('<i', fid.read(4))[0]
             if fmt_info is not None:
-                retval = read_data(fid, None, fmt_info, data_size, beg_ms, end_ms, mono, normalised, retype)
+                data = read_data(fid, None, fmt_info, data_size, beg_ms, end_ms, mono, normalised)
+                retval = data
                 break
             else:
                 data_cursor = fid.tell()
@@ -257,7 +365,7 @@ def read_segment(file, beg_ms=0, end_ms=None, mono=False, normalised=True, retur
     assert data_size is not None, 'Unable to read DATA block from file ' + fid.name
 
     if retval is None:
-        retval = read_data(fid, data_cursor, fmt_info, data_size, beg_ms, end_ms, mono, normalised, retype)
+        retval = read_data(fid, data_cursor, fmt_info, data_size, beg_ms, end_ms, mono, normalised)
 
     if return_fs:
         retval = (retval, rate)
@@ -445,17 +553,17 @@ def write(filename, rate, data, bitrate=None, markers=None, loops=None, pitch=No
     _write(filename, rate, data, bitrate, markers, loops, pitch)
 
 
-def write_24b(filename, rate, data):
-    """
-    Shortcut to write 24 bit audio
-    :param filename:
-    :param rate:
-    :param data:
-    :return:
-    """
-    assert data.dtype == numpy.uint8
-    shape = numpy.shape(data)
-    assert len(shape) == 3
-    assert shape[2] == 3
-
-    _write(filename, rate, data, bitrate=24)
+# def write_24b(filename, rate, data, markers=None, loops=None, pitch=None, normalized=False):
+#     """
+#     Shortcut to write 24 bit audio
+#     :param filename:
+#     :param rate:
+#     :param data:
+#     :return:
+#     """
+#     assert data.dtype == numpy.uint8
+#     shape = numpy.shape(data)
+#     assert len(shape) == 3
+#     assert shape[2] == 3
+#
+#     _write(filename, rate, data, 24, markers, loops, pitch)
